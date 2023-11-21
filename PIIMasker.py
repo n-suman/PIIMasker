@@ -1,11 +1,9 @@
 import tkinter as tk
-from tkinter import filedialog
 from PIL import Image, ImageTk, ImageDraw
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 import json
 import os
-import glob
 from tkinter import filedialog, messagebox
 
 
