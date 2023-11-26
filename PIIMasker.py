@@ -1,6 +1,8 @@
+import tempfile
 import tkinter as tk
 from PIL import Image, ImageTk, ImageDraw
 import ttkbootstrap as ttk
+from pdf2image import convert_from_path
 from ttkbootstrap.constants import *
 import json
 import os
@@ -11,6 +13,7 @@ class ImageEditor(ttk.Frame):
     def __init__(self, parent):
         super().__init__(parent)
 
+        self.scale_factor = None
         self.image_file_name = None
         self.tk_image = None
 
@@ -33,7 +36,6 @@ class ImageEditor(ttk.Frame):
         self.button_frame = ttk.Frame(self)
         self.button_frame.grid(row=2, column=0, columnspan=2, sticky="ew")
         self.create_buttons()
-
 
         self.image = None
         self.modified_image = None
@@ -72,18 +74,42 @@ class ImageEditor(ttk.Frame):
 
     def load_image(self):
         file_path = filedialog.askopenfilename()
-        if file_path:
-            self.image_file_name = file_path
-            self.image = Image.open(file_path)
-            self.modified_image = self.image.copy()
-            self.tk_image = ImageTk.PhotoImage(self.image)
-            self.canvas.create_image(0, 0, image=self.tk_image, anchor="nw")
-            self.canvas.config(scrollregion=self.canvas.bbox("all"))
+        if not file_path:
+            return
 
-            # Reset and load rectangles
-            self.rect_coords_list.clear()
-            self.rectangles.clear()
-            self.load_rectangles()
+        self.image_file_name = file_path
+        original_image = None
+
+        if file_path.lower().endswith('.pdf'):
+            with tempfile.NamedTemporaryFile(suffix=".pdf") as temp_pdf:
+                temp_pdf.write(open(file_path, "rb").read())
+                temp_pdf.flush()
+                images_from_pdf = convert_from_path(temp_pdf.name)
+                original_image = images_from_pdf[0]
+        else:
+            original_image = Image.open(file_path)
+
+        # Scale image to fit the canvas
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+        self.scale_factor = min(canvas_width / original_image.width, canvas_height / original_image.height)
+        scaled_size = (int(original_image.width * self.scale_factor), int(original_image.height * self.scale_factor))
+        self.image = original_image.resize(scaled_size, Image.Resampling.LANCZOS)
+
+        self.modified_image = self.image.copy()
+        self.tk_image = ImageTk.PhotoImage(self.image)
+        self.canvas.create_image(0, 0, image=self.tk_image, anchor="nw")
+        self.canvas.config(scrollregion=self.canvas.bbox("all"))
+        self.rect_coords_list.clear()
+        self.rectangles.clear()
+        # self.load_rectangles()
+
+        # Read and apply scale_factor and rectangles
+        if os.path.exists("rectangle_data.json"):
+            with open("rectangle_data.json", "r") as file:
+                data = json.load(file)
+                self.scale_factor = self.scale_factor if self.scale_factor is not None else data.get("scale_factor", 1.0)  # Default to 1.0 if not found
+                self.load_rectangles(data.get("rectangles", {}).get(self.image_file_name, []))
 
     def process_folder(self):
         source_folder = filedialog.askdirectory()
@@ -103,51 +129,87 @@ class ImageEditor(ttk.Frame):
             messagebox.showerror("Error", "No rectangle data available.")
             return
 
+        scale_factor = data.get("scale_factor", 1.0)
+        rectangles = data.get("rectangles", {})
+
         # Define a list of common image file extensions
         image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff']
 
         # Process each image file in the source folder
         for file_name in os.listdir(source_folder):
             file_path = os.path.join(source_folder, file_name)
-            if any(file_name.lower().endswith(ext) for ext in image_extensions):
-                image = Image.open(file_path)
+            if file_name.lower().endswith('.pdf'):
+                self.process_pdf(file_path, rectangles)
+            else:
+                if any(file_name.lower().endswith(ext) for ext in image_extensions):
+                    image = Image.open(file_path)
 
-                # Apply masking for each set of coordinates
-                for coords in data.values():
-                    for rect_coords in coords:
-                        draw = ImageDraw.Draw(image)
-                        draw.rectangle([rect_coords[0], rect_coords[1], rect_coords[2], rect_coords[3]], fill="white")
+                    # Apply masking for each set of coordinates
+                    for coords in rectangles.values():
+                        for rect_coords in coords:
+                            scaled_coords = [c / scale_factor for c in rect_coords]
+                            draw = ImageDraw.Draw(image)
+                            # draw.rectangle([rect_coords[0], rect_coords[1], rect_coords[2], rect_coords[3]],
+                            # fill="white")
+                            draw.rectangle([scaled_coords[0], scaled_coords[1], scaled_coords[2], scaled_coords[3]],
+                                           fill="white")
 
-                # Save the processed image in the 'masked' folder
-                masked_directory = os.path.join(os.path.dirname(source_folder), "masked")
-                if not os.path.exists(masked_directory):
-                    os.makedirs(masked_directory)
+                    # Save the processed image in the 'masked' folder
+                    masked_directory = os.path.join(os.path.dirname(source_folder), "masked")
+                    if not os.path.exists(masked_directory):
+                        os.makedirs(masked_directory)
 
-                save_path = os.path.join(masked_directory, file_name)
-                image.save(save_path)
+                    save_path = os.path.join(masked_directory, file_name)
+                    image.save(save_path)
 
         messagebox.showinfo("Info", "Folder processing complete.")
 
-    def load_rectangles(self):
-        if os.path.exists("rectangle_data.json"):
-            with open("rectangle_data.json", "r") as file:
-                data = json.load(file)
-                rectangles = data.get(self.image_file_name, [])
-                self.rect_coords_list = rectangles  # Load rectangle coordinates into the list
-                self.rectangles.clear()  # Clear any existing rectangles
+    def process_pdf(self, pdf_path, rect_data):
+        with tempfile.TemporaryDirectory() as path:
+            images_from_path = convert_from_path(pdf_path, output_folder=path)
+            processed_images = []
 
-                for coords in self.rect_coords_list:
-                    rect = self.canvas.create_rectangle(*coords, outline="red")
-                    self.rectangles.append(rect)  # Add the rectangle to the canvas and list
+            for image in images_from_path:
+                # Apply masking for each set of coordinates
+                for coords in rect_data.values():
+                    for rect_coords in coords:
+                        scaled_coords = [c / self.scale_factor for c in rect_coords]
+                        draw = ImageDraw.Draw(image)
+                        draw.rectangle([scaled_coords[0], scaled_coords[1], scaled_coords[2], scaled_coords[3]],
+                                       fill="white")
+                processed_images.append(image)
+
+            # Save the processed images back to a PDF
+            self.save_images_as_pdf(processed_images, pdf_path)
+
+    def save_images_as_pdf(self, images, original_pdf_path):
+        # Save the processed images in the 'masked' folder
+        masked_directory = os.path.join(os.path.dirname(original_pdf_path), "masked")
+        if not os.path.exists(masked_directory):
+            os.makedirs(masked_directory)
+
+        save_path = os.path.join(masked_directory, os.path.basename(original_pdf_path))
+        images[0].save(save_path, "PDF", resolution=100.0, save_all=True, append_images=images[1:])
+
+    def load_rectangles(self, rectangles):
+        for rect_coords in rectangles:
+            # Scale the coordinates based on the scale factor
+            scaled_coords = [coord * self.scale_factor for coord in rect_coords]
+            rect = self.canvas.create_rectangle(*scaled_coords, outline="red")
+            self.rectangles.append(rect)
 
     def save_rectangles(self):
-        if self.image_file_name:
+        if self.image_file_name and self.scale_factor is not None:
             data = {}
             if os.path.exists("rectangle_data.json"):
                 with open("rectangle_data.json", "r") as file:
                     data = json.load(file)
 
-            data[self.image_file_name] = [self.canvas.coords(rect) for rect in self.rectangles]
+            # data[self.image_file_name] = [self.canvas.coords(rect) for rect in self.rectangles]
+            data = {
+                "scale_factor": self.scale_factor,
+                "rectangles": {self.image_file_name: [self.canvas.coords(rect) for rect in self.rectangles]}
+            }
 
             with open("rectangle_data.json", "w") as file:
                 json.dump(data, file, indent=4)
@@ -180,20 +242,19 @@ class ImageEditor(ttk.Frame):
             self.update_canvas_image()
 
     def save_modified_image(self):
-        if self.modified_image and self.image_file_name:
-            # Extract directory and original filename
-            directory = os.path.dirname(self.image_file_name)
-            original_filename = os.path.basename(self.image_file_name)
+        if not self.modified_image:
+            return
 
-            # Create 'masked' folder if it doesn't exist
-            masked_directory = os.path.join(directory, "masked")
-            if not os.path.exists(masked_directory):
-                os.makedirs(masked_directory)
-
-            # Save the modified image in the 'masked' folder with the original filename
-            save_path = os.path.join(masked_directory, original_filename)
-            self.modified_image.save(save_path)
-            print(f"Image saved: {save_path}")
+        if self.image_file_name.lower().endswith('.pdf'):
+            save_path = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF files", "*.pdf")])
+            if save_path:
+                self.modified_image.save(save_path, "PDF", resolution=100.0)
+        else:
+            save_path = filedialog.asksaveasfilename(defaultextension=".png",
+                                                     filetypes=[("PNG files", "*.png"), ("JPEG files", "*.jpg"),
+                                                                ("All files", "*.*")])
+            if save_path:
+                self.modified_image.save(save_path)
 
     def update_canvas_image(self):
         self.tk_image = ImageTk.PhotoImage(self.modified_image)
